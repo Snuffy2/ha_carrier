@@ -50,7 +50,7 @@ async def async_get_config_entry_diagnostics(
                 carrier_system.config.raw, TO_REDACT_RAW
             ),
             "energy_raw": async_redact_data(
-                carrier_system.energy.raw, TO_REDACT_RAW
+                carrier_system.energy.raw if carrier_system.energy is not None else None, TO_REDACT_RAW
             ),
         }
         data[carrier_system.profile.serial] = system_data

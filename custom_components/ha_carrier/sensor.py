@@ -22,6 +22,7 @@ from .carrier_data_update_coordinator import CarrierDataUpdateCoordinator
 from .carrier_entity import CarrierEntity
 
 _LOGGER: Logger = getLogger(__package__)
+ENERGY_METRICS = ["cooling", "hp_heat", "fan", "electric_heat", "reheat", "fan_gas", "loop_pump"]
 
 
 async def async_setup_entry(hass, config_entry: ConfigEntry, async_add_entities):
@@ -50,12 +51,13 @@ async def async_setup_entry(hass, config_entry: ConfigEntry, async_add_entities)
             entities.append(HumidifierRemainingSensor(updater, carrier_system.profile.serial))
         if carrier_system.config.uv_enabled:
             entities.append(UVLampRemainingSensor(updater, carrier_system.profile.serial))
-        for electric_metric in ["cooling", "hp_heat", "fan", "electric_heat", "reheat", "fan_gas", "loop_pump"]:
-            if getattr(carrier_system.energy, electric_metric):
+        energy = carrier_system.energy
+        for electric_metric in ENERGY_METRICS:
+            if getattr(energy, electric_metric, False):
                 entities.append(EnergyMeasurementSensor(updater, carrier_system.profile.serial, electric_metric))
                 entities.append(DailyEnergyMeasurementSensor(updater, carrier_system.profile.serial, electric_metric))
                 entities.append(MonthlyEnergyMeasurementSensor(updater, carrier_system.profile.serial, electric_metric))
-        if carrier_system.energy.gas:
+        if getattr(energy, "gas", False):
             entities.append(GasMeasurementSensor(updater, carrier_system.profile.serial, "gas"))
             if carrier_system.config.fuel_type == 'propane':
                 entities.append(PropaneMeasurementSensor(updater, carrier_system.profile.serial))
@@ -109,7 +111,10 @@ class GasMeasurementSensor(CarrierEntity, SensorEntity):
 
     @property
     def native_value(self) -> float:
-        value = self.carrier_system.energy.current_year_measurements().gas
+        energy = getattr(self.carrier_system, "energy", None)
+        if energy is None:
+            return None
+        value = energy.current_year_measurements().gas
         match self.carrier_system.config.gas_unit:
             case "gallon":
                 value = value / 2.54998 # Convert kBTU to cubic feet (1 cubic foot = 2,549.98 BTU, so divide by 2.54998)
@@ -137,7 +142,10 @@ class PropaneMeasurementSensor(CarrierEntity, SensorEntity):
 
     @property
     def native_value(self) -> float:
-        value = self.carrier_system.energy.current_year_measurements().gas
+        energy = getattr(self.carrier_system, "energy", None)
+        if energy is None:
+            return None
+        value = energy.current_year_measurements().gas
         return value / 91.69 # Convert kBTU to gallons (1 gallon LPG = 91,690 BTU, so divide by 91.69)
 
     @property
@@ -158,7 +166,10 @@ class EnergyMeasurementSensor(CarrierEntity, SensorEntity):
 
     @property
     def native_value(self) -> float:
-        return getattr(self.carrier_system.energy.current_year_measurements(), self.entity_description.key)
+        energy = getattr(self.carrier_system, "energy", None)
+        if energy is None:
+            return None
+        return getattr(energy.current_year_measurements(), self.entity_description.key)
 
     @property
     def available(self) -> bool:
@@ -193,7 +204,10 @@ class DailyEnergyMeasurementSensor(CarrierEntity, SensorEntity):
     @property
     def native_value(self) -> float:
         """Return yesterday's consumption."""
-        energy_periods = self.carrier_system.energy.raw.get("energyPeriods", [])
+        energy = getattr(self.carrier_system, "energy", None)
+        if energy is None or energy.raw is None:
+            return None
+        energy_periods = energy.raw.get("energyPeriods", [])
         for period in energy_periods:
             if period.get("energyPeriodType") == "day1":
                 api_field = self.metric_map.get(self.metric)
@@ -203,7 +217,8 @@ class DailyEnergyMeasurementSensor(CarrierEntity, SensorEntity):
     @property
     def available(self) -> bool:
         """Return true if sensor is ready for display."""
-        return self.carrier_system.energy.raw is not None
+        energy = getattr(self.carrier_system, "energy", None)
+        return energy is not None and energy.raw is not None
 
 
 class MonthlyEnergyMeasurementSensor(CarrierEntity, SensorEntity):
@@ -233,7 +248,10 @@ class MonthlyEnergyMeasurementSensor(CarrierEntity, SensorEntity):
     @property
     def native_value(self) -> float:
         """Return last month's consumption."""
-        energy_periods = self.carrier_system.energy.raw.get("energyPeriods", [])
+        energy = getattr(self.carrier_system, "energy", None)
+        if energy is None or energy.raw is None:
+            return None
+        energy_periods = energy.raw.get("energyPeriods", [])
         for period in energy_periods:
             if period.get("energyPeriodType") == "month1":
                 api_field = self.metric_map.get(self.metric)
@@ -243,7 +261,8 @@ class MonthlyEnergyMeasurementSensor(CarrierEntity, SensorEntity):
     @property
     def available(self) -> bool:
         """Return true if sensor is ready for display."""
-        return self.carrier_system.energy.raw is not None
+        energy = getattr(self.carrier_system, "energy", None)
+        return energy is not None and energy.raw is not None
 
 
 class ZoneTemperatureSensor(CarrierEntity, SensorEntity):
