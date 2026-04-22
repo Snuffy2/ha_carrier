@@ -1,26 +1,26 @@
 """Create diagnostics."""
 
 from __future__ import annotations
+
+from logging import Logger, getLogger
 from typing import Any
 
 import attr
-from logging import Logger, getLogger
-
 from homeassistant.components.diagnostics import async_redact_data
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import device_registry as dr, entity_registry as er
 
+from .carrier_data_update_coordinator import CarrierDataUpdateCoordinator
 from .const import (
-    DOMAIN,
     DATA_UPDATE_COORDINATOR,
+    DOMAIN,
     TO_REDACT,
-    TO_REDACT_MAPPED,
-    TO_REDACT_RAW,
     TO_REDACT_DEVICE,
     TO_REDACT_ENTITIES,
+    TO_REDACT_MAPPED,
+    TO_REDACT_RAW,
 )
-from .carrier_data_update_coordinator import CarrierDataUpdateCoordinator
 
 LOGGER: Logger = getLogger(__package__)
 
@@ -29,29 +29,19 @@ async def async_get_config_entry_diagnostics(
     hass: HomeAssistant, config_entry: ConfigEntry
 ) -> dict[str, dict[str, Any]]:
     """Return diagnostics for a config entry."""
-    updater: CarrierDataUpdateCoordinator = hass.data[DOMAIN][
-        config_entry.entry_id
-    ][DATA_UPDATE_COORDINATOR]
+    updater: CarrierDataUpdateCoordinator = hass.data[DOMAIN][config_entry.entry_id][
+        DATA_UPDATE_COORDINATOR
+    ]
     data = {
         "entry": async_redact_data(config_entry.as_dict(), TO_REDACT),
     }
     for carrier_system in updater.systems:
         system_data = {
-            "mapped_data": async_redact_data(
-                carrier_system.__repr__(), TO_REDACT_MAPPED
-            ),
-            "profile_raw": async_redact_data(
-                carrier_system.profile.raw, TO_REDACT_RAW
-            ),
-            "status_raw": async_redact_data(
-                carrier_system.status.raw, TO_REDACT_RAW
-            ),
-            "config_raw": async_redact_data(
-                carrier_system.config.raw, TO_REDACT_RAW
-            ),
-            "energy_raw": async_redact_data(
-                carrier_system.energy.raw, TO_REDACT_RAW
-            ),
+            "mapped_data": async_redact_data(carrier_system.__repr__(), TO_REDACT_MAPPED),
+            "profile_raw": async_redact_data(carrier_system.profile.raw, TO_REDACT_RAW),
+            "status_raw": async_redact_data(carrier_system.status.raw, TO_REDACT_RAW),
+            "config_raw": async_redact_data(carrier_system.config.raw, TO_REDACT_RAW),
+            "energy_raw": async_redact_data(carrier_system.energy.raw, TO_REDACT_RAW),
         }
         data[carrier_system.profile.serial] = system_data
 

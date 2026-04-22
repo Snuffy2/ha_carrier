@@ -1,16 +1,18 @@
 """Update data from carrier api."""
-from datetime import timedelta, datetime, UTC
+
+from datetime import UTC, datetime, timedelta
 from logging import Logger, getLogger
 
-
-from carrier_api import ApiConnectionGraphql, System, Energy
+from carrier_api import ApiConnectionGraphql, Energy, System
 from carrier_api.api_websocket_data_updater import WebsocketDataUpdater
 from gql.transport.exceptions import TransportServerError
-
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.debounce import Debouncer
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed, \
-    REQUEST_REFRESH_DEFAULT_COOLDOWN
+from homeassistant.helpers.update_coordinator import (
+    REQUEST_REFRESH_DEFAULT_COOLDOWN,
+    DataUpdateCoordinator,
+    UpdateFailed,
+)
 
 from .const import DOMAIN, TO_REDACT_MAPPED
 from .util import async_redact_data
@@ -21,21 +23,23 @@ DEFAULT_UPDATE_INTERVAL_MINUTES = 30
 
 class CarrierDataUpdateCoordinator(DataUpdateCoordinator):
     """Update data from carrier api."""
-    systems: list[System] = None
-    websocket_data_updater: WebsocketDataUpdater = None
+
+    systems: list[System]
+    websocket_data_updater: WebsocketDataUpdater | None = None
     data_flush: bool = True
-    timestamp_all_data = None
-    timestamp_websocket = None
-    timestamp_energy = None
+    timestamp_all_data: datetime | None = None
+    timestamp_websocket: datetime | None = None
+    timestamp_energy: datetime | None = None
 
     def __init__(
-            self,
-            hass: HomeAssistant,
-            api_connection: ApiConnectionGraphql,
+        self,
+        hass: HomeAssistant,
+        api_connection: ApiConnectionGraphql,
     ) -> None:
         """Initialize the device."""
         self.hass: HomeAssistant = hass
         self.api_connection: ApiConnectionGraphql = api_connection
+        self.systems = []
 
         super().__init__(
             hass,
@@ -49,7 +53,7 @@ class CarrierDataUpdateCoordinator(DataUpdateCoordinator):
                 cooldown=REQUEST_REFRESH_DEFAULT_COOLDOWN,
                 immediate=False,
                 function=self.async_refresh,
-            )
+            ),
         )
 
     async def _async_update_data(self):
@@ -57,25 +61,27 @@ class CarrierDataUpdateCoordinator(DataUpdateCoordinator):
             if self.data_flush:
                 _LOGGER.debug("fetching fresh all data")
                 fresh_systems: list[System] = await self.api_connection.load_data()
-                if self.systems is None:
+                if not self.systems:
                     self.systems = fresh_systems
                     self.websocket_data_updater = WebsocketDataUpdater(systems=self.systems)
-                    self.api_connection.api_websocket.callback_add(self.websocket_data_updater.message_handler)
+                    self.api_connection.api_websocket.callback_add(
+                        self.websocket_data_updater.message_handler
+                    )
                     self.api_connection.api_websocket.callback_add(self.updated_callback)
                 else:
                     for fresh_system in fresh_systems:
                         related_stale_system = self.system(fresh_system.profile.serial)
                         if related_stale_system is None:
-                            _LOGGER.error(f"unable to find matching system, serial {fresh_system.profile.serial}")
+                            _LOGGER.error(
+                                f"unable to find matching system, serial {fresh_system.profile.serial}"
+                            )
                         else:
                             related_stale_system.profile = fresh_system.profile
                             related_stale_system.status = fresh_system.status
                             related_stale_system.config = fresh_system.config
                             related_stale_system.energy = fresh_system.energy
                 for system in self.systems:
-                    _LOGGER.debug(
-                        async_redact_data(system.__repr__(), TO_REDACT_MAPPED)
-                    )
+                    _LOGGER.debug(async_redact_data(system.__repr__(), TO_REDACT_MAPPED))
                 self.timestamp_all_data = datetime.now(UTC)
                 self.timestamp_energy = self.timestamp_all_data
                 self.data_flush = False
@@ -97,19 +103,20 @@ class CarrierDataUpdateCoordinator(DataUpdateCoordinator):
         except Exception as error:
             _LOGGER.exception(error)
             self.data_flush = True
-            _LOGGER.debug("unrecognized error so retying in default 30 minutes but refreshing all data then.")
+            _LOGGER.debug(
+                "unrecognized error so retrying in default 30 minutes but refreshing all data then."
+            )
             raise UpdateFailed(error) from error
 
     def system(self, system_serial: str) -> System | None:
-        for system in self.systems:
+        for system in self.systems or []:
             if system.profile.serial == system_serial:
                 return system
+        return None
 
     async def updated_callback(self, _message: str) -> None:
         self.timestamp_websocket = datetime.now(UTC)
         _LOGGER.debug("websocket updated system")
         for system in self.systems:
-            _LOGGER.debug(
-                async_redact_data(system.__repr__(), TO_REDACT_MAPPED)
-            )
+            _LOGGER.debug(async_redact_data(system.__repr__(), TO_REDACT_MAPPED))
         self.async_update_listeners()

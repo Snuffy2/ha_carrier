@@ -1,24 +1,25 @@
-name: "Lint"
+name: Lint
+
 on:
   push:
     branches:
-      - "main"
+      - main
   pull_request:
     branches:
-      - "main"
+      - main
+  workflow_dispatch:
+
 jobs:
-  ruff:
-    name: "Ruff"
-    runs-on: "ubuntu-latest"
+  pre-commit:
+    name: Pre-commit
+    runs-on: ubuntu-latest
     steps:
-        - name: "Checkout the repository"
-          uses: "actions/checkout@v6"
-        - name: "Set up Python"
-          uses: actions/setup-python@v6.2.0
+        - name: Checkout the repository
+          uses: actions/checkout@v6
+        - name: Set up Python
+          uses: actions/setup-python@v6
           with:
-            python-version: "3.13"
-            cache: "pip"
-        - name: "Install requirements"
-          run: python3 -m pip install -r requirements.txt
-        - name: "Run"
-          run: python3 -m ruff check .
+            python-version: '3.14'
+            cache: 'pip'
+        - name: Run pre-commit
+          uses: pre-commit/action@v3.0.1

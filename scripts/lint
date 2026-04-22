@@ -4,4 +4,4 @@ set -e
 
 cd "$(dirname "$0")/.."
 
-ruff check . --fix
+python -m pre_commit run --all-files

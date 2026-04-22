@@ -44,7 +44,7 @@ People *love* thorough bug reports. I'm not even kidding.
 
 ## Use a Consistent Coding Style
 
-Use [black](https://github.com/ambv/black) to make sure the code follows the style.
+Run [pre-commit](https://pre-commit.com/) with `scripts/lint` to apply the repository's standard checks, Ruff fixes, and mypy validation.
 
 ## Test your code modification
 

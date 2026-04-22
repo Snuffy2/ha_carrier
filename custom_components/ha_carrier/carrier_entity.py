@@ -1,26 +1,26 @@
 """Base entity for carrier devices."""
-from logging import getLogger, Logger
 
-from carrier_api import StatusZone, ConfigZone, System
+from logging import Logger, getLogger
+
+from carrier_api import ConfigZone, StatusZone, System
 from homeassistant.helpers.entity import DeviceInfo
-from homeassistant.helpers.update_coordinator import (
-    CoordinatorEntity,
-)
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import DOMAIN
 from .carrier_data_update_coordinator import CarrierDataUpdateCoordinator
+from .const import DOMAIN
 
 _LOGGER: Logger = getLogger(__package__)
 
 
 class CarrierEntity(CoordinatorEntity[CarrierDataUpdateCoordinator]):
     """Base entity for carrier devices."""
+
     def __init__(
-            self,
-            entity_type: str,
-            updater: CarrierDataUpdateCoordinator,
-            context: str,
-            **kwargs,
+        self,
+        entity_type: str,
+        updater: CarrierDataUpdateCoordinator,
+        context: str,
+        **kwargs,
     ) -> None:
         """Create unique_id and access to api data."""
         super().__init__(updater, context)
