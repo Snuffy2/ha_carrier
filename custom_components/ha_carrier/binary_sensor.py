@@ -19,6 +19,33 @@ from .carrier_entity import CarrierEntity
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
 
+def _compute_zone_name(
+    updater: CarrierDataUpdateCoordinator, system_serial: str, zone_api_id: str
+) -> str:
+    """Return the configured display name for a Carrier zone.
+
+    Args:
+        updater: Coordinator that provides system and zone state.
+        system_serial: Unique Carrier system serial number.
+        zone_api_id: API identifier for the target zone.
+
+    Returns:
+        str: Resolved zone name.
+
+    Raises:
+        ValueError: Raised when the Carrier system or zone cannot be found.
+    """
+    carrier_system = updater.system(system_serial=system_serial)
+    if carrier_system is None:
+        raise ValueError(f"Carrier System not found: {system_serial}")
+
+    for zone in carrier_system.config.zones:
+        if zone.api_id == zone_api_id:
+            return zone.name
+
+    raise ValueError(f"Config Zone not found: {zone_api_id}")
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     config_entry: ConfigEntryCarrier,
@@ -34,7 +61,7 @@ async def async_setup_entry(
     Returns:
         None: Entities are added through the callback.
     """
-    updater = config_entry.runtime_data
+    updater = config_entry.runtime_data.coordinator
     entities = []
     for carrier_system in updater.systems:
         entities.extend(
@@ -79,7 +106,10 @@ class OnlineSensor(CarrierEntity, BinarySensorEntity):
         Returns:
             bool | None: True when connected, False when disconnected.
         """
-        return not self.carrier_system.status.is_disconnected
+        disconnected = self.carrier_system.status.is_disconnected
+        if disconnected is None:
+            return None
+        return not disconnected
 
     @property
     def icon(self) -> str | None:
@@ -99,7 +129,7 @@ class OnlineSensor(CarrierEntity, BinarySensorEntity):
         Returns:
             bool: True when state is available.
         """
-        return self.is_on is not None
+        return self.carrier_system.status.is_disconnected is not None
 
 
 class OccupancySensor(CarrierEntity, BinarySensorEntity):
@@ -117,10 +147,9 @@ class OccupancySensor(CarrierEntity, BinarySensorEntity):
             system_serial: Unique Carrier system serial number.
             zone_api_id: API identifier for the target zone.
         """
+        zone_name = _compute_zone_name(updater, system_serial, zone_api_id)
         self.zone_api_id: str = zone_api_id
-        self.coordinator = updater
-        self.coordinator_context = system_serial
-        super().__init__(f"{self._config_zone.name} Occupancy", updater, system_serial)
+        super().__init__(f"{zone_name} Occupancy", updater, system_serial)
 
     @property
     def is_on(self) -> bool | None:

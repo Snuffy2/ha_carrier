@@ -61,7 +61,7 @@ async def async_setup_entry(
     """
     _LOGGER.debug("setting up climate entry")
     infinite_hold = config_entry.options.get(CONF_INFINITE_HOLDS, DEFAULT_INFINITE_HOLDS)
-    updater = config_entry.runtime_data
+    updater = config_entry.runtime_data.coordinator
     entities = []
     for carrier_system in updater.systems:
         for zone in carrier_system.config.zones:

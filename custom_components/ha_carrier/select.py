@@ -33,7 +33,7 @@ async def async_setup_entry(
     Returns:
         None: Entities are registered through the callback.
     """
-    updater = config_entry.runtime_data
+    updater = config_entry.runtime_data.coordinator
     entities = []
     for system in updater.systems:
         entities.extend(
@@ -108,11 +108,21 @@ class HeatSourceSelect(CarrierEntity, SelectEntity):
         Returns:
             None: The state is updated in-place and written to Home Assistant.
         """
-        new_heat_source: HeatSourceTypes = {
+        option_map: dict[str, HeatSourceTypes] = {
             self.idu_only_label(): HeatSourceTypes.IDU_ONLY,
             HEAT_SOURCE_ODU_ONLY_LABEL: HeatSourceTypes.ODU_ONLY,
             HEAT_SOURCE_SYSTEM_LABEL: HeatSourceTypes.SYSTEM,
-        }.get(option, HeatSourceTypes.SYSTEM)
+        }
+        if option not in option_map:
+            available_options = ", ".join(option_map)
+            _LOGGER.warning(
+                "Unexpected heat source option '%s'; expected one of: %s",
+                option,
+                available_options,
+            )
+            raise ValueError(f"Unknown heat source option: {option}")
+
+        new_heat_source = option_map[option]
         _LOGGER.debug("Selected heat source: %s", new_heat_source)
         await self.coordinator.async_perform_api_call(
             "set heat source",

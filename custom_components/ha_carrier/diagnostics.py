@@ -39,7 +39,9 @@ async def async_get_config_entry_diagnostics(
         dict[str, dict[str, Any]]: Redacted diagnostics keyed by section name
         and system serial.
     """
-    updater = config_entry.runtime_data
+    updater = config_entry.runtime_data.coordinator
+    device_registry = dr.async_get(hass)
+    entity_registry = er.async_get(hass)
     data = {
         "entry": async_redact_data(config_entry.as_dict(), TO_REDACT),
     }
@@ -55,8 +57,6 @@ async def async_get_config_entry_diagnostics(
         }
         data[carrier_system.profile.serial] = system_data
 
-        device_registry = dr.async_get(hass)
-        entity_registry = er.async_get(hass)
         hass_device = device_registry.async_get_device(
             identifiers={(DOMAIN, str(carrier_system.profile.serial))}
         )
