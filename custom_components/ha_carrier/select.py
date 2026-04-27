@@ -33,7 +33,7 @@ async def async_setup_entry(
     Returns:
         None: Entities are registered through the callback.
     """
-    updater = config_entry.runtime_data
+    updater = config_entry.runtime_data.coordinator
     entities = []
     for system in updater.systems:
         entities.extend(

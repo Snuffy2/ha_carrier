@@ -39,7 +39,7 @@ async def async_get_config_entry_diagnostics(
         dict[str, dict[str, Any]]: Redacted diagnostics keyed by section name
         and system serial.
     """
-    updater = config_entry.runtime_data
+    updater = config_entry.runtime_data.coordinator
     data = {
         "entry": async_redact_data(config_entry.as_dict(), TO_REDACT),
     }

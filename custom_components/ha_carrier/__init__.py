@@ -3,16 +3,14 @@
 import asyncio
 import logging
 
-from aiohttp import ClientError
 from carrier_api import ApiConnectionGraphql
-from gql.transport.exceptions import TransportError, TransportServerError
-from homeassistant.config_entries import ConfigEntry
+from gql.transport.exceptions import TransportServerError
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers import config_validation as cv
 
-from .carrier_data_update_coordinator import CarrierDataUpdateCoordinator, CarrierUnauthorizedError
+from .carrier_data_update_coordinator import CarrierDataUpdateCoordinator
 from .const import (
     DOMAIN,
     PLATFORMS,
@@ -20,9 +18,13 @@ from .const import (
     WEBSOCKET_RETRY_INITIAL_DELAY_SECONDS,
     WEBSOCKET_RETRY_MAX_DELAY_SECONDS,
 )
-from .util import async_redact_data
-
-type ConfigEntryCarrier = ConfigEntry[CarrierDataUpdateCoordinator]
+from .runtime import (
+    ConfigEntryCarrier,
+    get_runtime_data,
+    handle_setup_unauthorized,
+    reset_setup_unauthorized_count,
+)
+from .util import WEBSOCKET_RECOVERABLE_EXCEPTIONS, async_redact_data, is_unauthorized_error
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
@@ -41,13 +43,7 @@ async def _async_await_websocket_task(websocket_task: asyncio.Task[None]) -> Non
         await websocket_task
     except asyncio.CancelledError:
         pass
-    except (
-        CarrierUnauthorizedError,
-        ClientError,
-        TimeoutError,
-        OSError,
-        TransportError,
-    ):
+    except WEBSOCKET_RECOVERABLE_EXCEPTIONS:
         _LOGGER.exception("websocket task raised during cancellation")
 
 
@@ -68,13 +64,14 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntryCarrie
     Raises:
         ConfigEntryNotReady: Raised when authentication or initial data loading
             fails and Home Assistant should retry setup later.
-        CarrierUnauthorizedError: Raised when repeated unauthorized responses
-            indicate invalid credentials rather than a transient outage.
+        ConfigEntryAuthFailed: Raised when repeated unauthorized responses
+            indicate invalid credentials and Home Assistant should reauth.
     """
     _LOGGER.debug(
         "async setup entry: %s",
         async_redact_data(config_entry.as_dict(), TO_REDACT),
     )
+    runtime_data = get_runtime_data(config_entry)
     username = config_entry.data[CONF_USERNAME]
     password = config_entry.data[CONF_PASSWORD]
 
@@ -83,9 +80,10 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntryCarrie
         coordinator = CarrierDataUpdateCoordinator(
             hass=hass,
             api_connection=api_connection,
+            config_entry=config_entry,
         )
+        runtime_data.coordinator = coordinator
         await coordinator.async_config_entry_first_refresh()
-        config_entry.runtime_data = coordinator
 
         async def ws_updates() -> None:
             """Keep websocket updates running for this config entry.
@@ -111,13 +109,7 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntryCarrie
                 except asyncio.CancelledError:
                     _LOGGER.debug("websocket task cancelled")
                     raise
-                except (
-                    CarrierUnauthorizedError,
-                    ClientError,
-                    TimeoutError,
-                    OSError,
-                    TransportError,
-                ):
+                except WEBSOCKET_RECOVERABLE_EXCEPTIONS:
                     _LOGGER.exception(
                         "websocket task exception; retrying in %s seconds", retry_delay_seconds
                     )
@@ -146,21 +138,31 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntryCarrie
 
         config_entry.async_on_unload(cancel_websocket_task)
     except TransportServerError as error:
+        if is_unauthorized_error(error):
+            handle_setup_unauthorized(config_entry, error)
         _LOGGER.exception("Carrier transport error during setup")
         raise ConfigEntryNotReady(error) from error
-    except CarrierUnauthorizedError:
+    except ConfigEntryAuthFailed as error:
+        if is_unauthorized_error(error):
+            handle_setup_unauthorized(config_entry, error)
         _LOGGER.exception("Carrier unauthorized during setup")
         raise
     except ConfigEntryNotReady as error:
+        if is_unauthorized_error(error):
+            _LOGGER.exception("Carrier unauthorized during setup")
+            handle_setup_unauthorized(config_entry, error)
         if isinstance(error.__cause__, TransportServerError):
             transport_error = error.__cause__
             _LOGGER.exception("Carrier transport error during setup")
             raise ConfigEntryNotReady(transport_error) from transport_error
-        if isinstance(error.__cause__, CarrierUnauthorizedError):
-            unauthorized_error = error.__cause__
-            _LOGGER.exception("Carrier unauthorized during setup")
-            raise unauthorized_error from error
         raise
+    except WEBSOCKET_RECOVERABLE_EXCEPTIONS as error:
+        if is_unauthorized_error(error):
+            handle_setup_unauthorized(config_entry, error)
+        _LOGGER.exception("Carrier recoverable error during setup")
+        raise ConfigEntryNotReady(error) from error
+
+    reset_setup_unauthorized_count(config_entry)
 
     await hass.config_entries.async_forward_entry_setups(config_entry, PLATFORMS)
 
@@ -193,11 +195,12 @@ async def async_unload_entry(hass: HomeAssistant, config_entry: ConfigEntryCarri
         bool: True when all platforms were unloaded cleanly.
     """
     _LOGGER.debug("unload entry")
-    websocket_task = config_entry.runtime_data.websocket_task
+    coordinator = config_entry.runtime_data.coordinator
+    websocket_task = coordinator.websocket_task
 
     if websocket_task is not None:
         websocket_task.cancel()
         await _async_await_websocket_task(websocket_task)
-        config_entry.runtime_data.websocket_task = None
+        coordinator.websocket_task = None
 
     return await hass.config_entries.async_unload_platforms(config_entry, PLATFORMS)

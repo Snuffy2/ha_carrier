@@ -34,7 +34,7 @@ async def async_setup_entry(
     Returns:
         None: Entities are added through the callback.
     """
-    updater = config_entry.runtime_data
+    updater = config_entry.runtime_data.coordinator
     entities = []
     for carrier_system in updater.systems:
         entities.extend(
