@@ -40,6 +40,22 @@ BASE_SUPPORT_FLAGS: ClimateEntityFeature = (
     | ClimateEntityFeature.PRESET_MODE
 )
 
+HEAT_TYPES: list[str] = [
+    "hp_heat",
+    "electric_heat",
+    "reheat",
+    "loop_pump",
+]
+
+COOL_TYPES: list[str] = [
+    "cooling",
+]
+
+FAN_TYPES: list[str] = [
+    "fan",
+    "fan_gas",
+]
+
 
 async def async_setup_entry(
     hass: HomeAssistant,

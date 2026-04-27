@@ -5,6 +5,7 @@ from __future__ import annotations
 from functools import partial
 import logging
 
+from carrier_api import System
 from carrier_api.const import HeatSourceTypes
 from homeassistant.components.select import SelectEntity
 from homeassistant.core import HomeAssistant
@@ -18,6 +19,18 @@ from .const import HEAT_SOURCE_IDU_ONLY_LABEL, HEAT_SOURCE_ODU_ONLY_LABEL, HEAT_
 from .util import has_heat
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
+
+HEAT_TYPES: list[str] = [
+    "hp_heat",
+    "electric_heat",
+    "reheat",
+    "loop_pump",
+]
+
+
+def has_heat(carrier_system: System) -> bool:
+    """Return True if the Carrier system supports heat source selection."""
+    return any(getattr(carrier_system.energy, heat_type, False) is True for heat_type in HEAT_TYPES)
 
 
 async def async_setup_entry(
