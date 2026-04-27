@@ -6,18 +6,12 @@ from datetime import UTC, datetime, timedelta
 import logging
 from typing import Any, NoReturn
 
-from aiohttp import ClientError
-from carrier_api import ApiConnectionGraphql, AuthError, BaseError, Energy, System
+from carrier_api import ApiConnectionGraphql, Energy, System
 from carrier_api.api_websocket_data_updater import WebsocketDataUpdater
-from gql.transport.exceptions import (
-    TransportConnectionFailed,
-    TransportError,
-    TransportProtocolError,
-    TransportQueryError,
-    TransportServerError,
-)
+from gql.transport.exceptions import TransportServerError
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import HomeAssistantError
+from homeassistant.exceptions import ConfigEntryAuthFailed, HomeAssistantError
 from homeassistant.helpers.debounce import Debouncer
 from homeassistant.helpers.update_coordinator import (
     REQUEST_REFRESH_DEFAULT_COOLDOWN,
@@ -29,17 +23,27 @@ from .const import (
     DEFAULT_UPDATE_INTERVAL_MINUTES,
     DOMAIN,
     MAX_WRITE_ATTEMPTS,
+    SHORT_REFRESH_INTERVAL_MINUTES,
     TO_REDACT_MAPPED,
     UNAUTHORIZED_RETRY_THRESHOLD,
     WRITE_RETRY_DELAY_SECONDS,
 )
-from .util import async_redact_data
+from .exceptions import CarrierUnauthorizedError
+from .util import (
+    RECOVERABLE_REFRESH_EXCEPTIONS,
+    WEBSOCKET_RECOVERABLE_EXCEPTIONS,
+    async_redact_data,
+    is_retryable_write_error,
+    is_unauthorized_error,
+)
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
-
-
-class CarrierUnauthorizedError(Exception):
-    """Raised when unauthorized responses stop looking transient."""
+RECONCILE_FAILED_WRITE_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    CarrierUnauthorizedError,
+    HomeAssistantError,
+    UpdateFailed,
+    *RECOVERABLE_REFRESH_EXCEPTIONS,
+)
 
 
 class CarrierDataUpdateCoordinator(DataUpdateCoordinator[list[dict[str, Any]]]):
@@ -49,15 +53,19 @@ class CarrierDataUpdateCoordinator(DataUpdateCoordinator[list[dict[str, Any]]]):
         self,
         hass: HomeAssistant,
         api_connection: ApiConnectionGraphql,
+        config_entry: ConfigEntry[Any] | None = None,
     ) -> None:
         """Initialize coordinator state and refresh scheduling.
 
         Args:
             hass: Home Assistant instance used for task scheduling and callbacks.
             api_connection: Authenticated Carrier API connection wrapper.
+            config_entry: Config entry used to start reauthentication when
+                repeated unauthorized write failures indicate invalid credentials.
         """
         self.hass: HomeAssistant = hass
         self.api_connection: ApiConnectionGraphql = api_connection
+        self.config_entry: ConfigEntry[Any] | None = config_entry
         self.consecutive_unauthorized_count = 0
         self.unauthorized_outage_logged = False
         self.unauthorized_escalated_logged = False
@@ -74,6 +82,7 @@ class CarrierDataUpdateCoordinator(DataUpdateCoordinator[list[dict[str, Any]]]):
         super().__init__(
             hass,
             _LOGGER,
+            config_entry=config_entry,
             name=f"{DOMAIN}-{self.api_connection.username}",
             update_interval=timedelta(minutes=DEFAULT_UPDATE_INTERVAL_MINUTES),
             always_update=False,
@@ -147,7 +156,7 @@ class CarrierDataUpdateCoordinator(DataUpdateCoordinator[list[dict[str, Any]]]):
                             system.profile.serial
                         )
                     except TransportServerError as server_error:
-                        if not self._is_unauthorized_error(server_error):
+                        if not is_unauthorized_error(server_error):
                             raise
                         # Preserve the last known energy payload while probing whether
                         # the unauthorized response is just a transient Carrier outage.
@@ -161,23 +170,25 @@ class CarrierDataUpdateCoordinator(DataUpdateCoordinator[list[dict[str, Any]]]):
                             "Carrier API repeatedly rejected energy refresh requests; "
                             "check credentials or service health."
                         )
-                    self.update_interval = timedelta(minutes=1)
-                else:
-                    self.timestamp_energy = datetime.now(UTC)
-                    self._reset_unauthorized_tracking()
-                    self.update_interval = timedelta(minutes=DEFAULT_UPDATE_INTERVAL_MINUTES)
+                    self.update_interval = timedelta(minutes=SHORT_REFRESH_INTERVAL_MINUTES)
+                    raise UpdateFailed(
+                        "Carrier API temporarily rejected the energy refresh; retrying soon."
+                    )
+                self.timestamp_energy = datetime.now(UTC)
+                self._reset_unauthorized_tracking()
+                self.update_interval = timedelta(minutes=DEFAULT_UPDATE_INTERVAL_MINUTES)
             return [self.mapped_system_data(system) for system in self.systems]
         except CarrierUnauthorizedError as error:
             self.data_flush = True
-            self.update_interval = timedelta(minutes=1)
-            raise UpdateFailed(str(error)) from error
+            self.update_interval = timedelta(minutes=SHORT_REFRESH_INTERVAL_MINUTES)
+            raise ConfigEntryAuthFailed(str(error)) from error
         except TransportServerError as server_error:
             self.data_flush = True
-            if self._is_unauthorized_error(server_error):
+            if is_unauthorized_error(server_error):
                 should_escalate = self._record_unauthorized(refresh_context)
-                self.update_interval = timedelta(minutes=1)
+                self.update_interval = timedelta(minutes=SHORT_REFRESH_INTERVAL_MINUTES)
                 if should_escalate:
-                    raise UpdateFailed(
+                    raise ConfigEntryAuthFailed(
                         "Carrier API repeatedly rejected refresh requests; "
                         "check credentials or service health."
                     ) from server_error
@@ -186,42 +197,31 @@ class CarrierDataUpdateCoordinator(DataUpdateCoordinator[list[dict[str, Any]]]):
                 ) from server_error
             _LOGGER.exception("Carrier refresh hit a transport server error")
             _LOGGER.debug("transport error likely carrier api maintenance so retrying in 1 minute.")
-            self.update_interval = timedelta(minutes=1)
+            self.update_interval = timedelta(minutes=SHORT_REFRESH_INTERVAL_MINUTES)
             raise UpdateFailed(
                 f"Carrier transport server error during refresh: {server_error}"
             ) from server_error
         except asyncio.CancelledError, KeyboardInterrupt, SystemExit:
             raise
-        except (
-            AuthError,
-            BaseError,
-            ClientError,
-            TimeoutError,
-            TransportConnectionFailed,
-            TransportError,
-            TransportProtocolError,
-            TransportQueryError,
-        ) as error:
-            _LOGGER.exception("Carrier refresh failed with an unexpected error")
+        except RECOVERABLE_REFRESH_EXCEPTIONS as error:
             self.data_flush = True
+            if is_unauthorized_error(error):
+                should_escalate = self._record_unauthorized(refresh_context)
+                self.update_interval = timedelta(minutes=SHORT_REFRESH_INTERVAL_MINUTES)
+                if should_escalate:
+                    raise ConfigEntryAuthFailed(
+                        "Carrier API repeatedly rejected refresh requests; "
+                        "check credentials or service health."
+                    ) from error
+                raise UpdateFailed(
+                    "Carrier API temporarily rejected the refresh; retrying soon."
+                ) from error
+            _LOGGER.exception("Carrier refresh failed with an unexpected error")
             self.update_interval = timedelta(minutes=DEFAULT_UPDATE_INTERVAL_MINUTES)
             _LOGGER.debug(
                 "unrecognized error so retrying in default 30 minutes but refreshing all data then."
             )
             raise UpdateFailed(f"Unexpected error during Carrier refresh: {error}") from error
-
-    @staticmethod
-    def _is_unauthorized_error(error: Exception) -> bool:
-        """Determine whether an exception represents a Carrier unauthorized response.
-
-        Args:
-            error: Exception raised by the Carrier client or transport.
-
-        Returns:
-            bool: True when the error maps to an HTTP 401-style failure.
-        """
-        status_code = getattr(error, "code", None) or getattr(error, "status", None)
-        return status_code == 401
 
     def _reset_unauthorized_tracking(self) -> None:
         """Clear the unauthorized counters after a successful Carrier request.
@@ -265,20 +265,6 @@ class CarrierDataUpdateCoordinator(DataUpdateCoordinator[list[dict[str, Any]]]):
             self.unauthorized_escalated_logged = True
         return self.consecutive_unauthorized_count >= UNAUTHORIZED_RETRY_THRESHOLD
 
-    def _is_retryable_write_error(self, error: Exception) -> bool:
-        """Return whether a write failure should be retried once.
-
-        Args:
-            error: Exception raised while sending a Carrier write request.
-
-        Returns:
-            bool: True when the failure matches a transient unauthorized or
-            timeout condition.
-        """
-        if isinstance(error, TransportServerError):
-            return self._is_unauthorized_error(error)
-        return isinstance(error, TimeoutError)
-
     async def _async_retry_write(self, attempt: int) -> bool:
         """Delay before retrying a failed write when attempts remain.
 
@@ -293,7 +279,9 @@ class CarrierDataUpdateCoordinator(DataUpdateCoordinator[list[dict[str, Any]]]):
         await asyncio.sleep(WRITE_RETRY_DELAY_SECONDS)
         return True
 
-    async def _async_handle_failed_write(self, operation_name: str, error: Exception) -> NoReturn:
+    async def _async_handle_failed_write(
+        self, operation_name: str, error: BaseException
+    ) -> NoReturn:
         """Recover from a failed write and raise a user-facing Home Assistant error.
 
         Forces a refresh so entity state is reconciled with the Carrier backend
@@ -306,9 +294,7 @@ class CarrierDataUpdateCoordinator(DataUpdateCoordinator[list[dict[str, Any]]]):
         Raises:
             HomeAssistantError: Raised with a message tailored to the failure type.
         """
-        is_unauthorized_write = isinstance(
-            error, TransportServerError
-        ) and self._is_unauthorized_error(error)
+        is_unauthorized_write = is_unauthorized_error(error)
         should_escalate = False
 
         if is_unauthorized_write:
@@ -318,6 +304,8 @@ class CarrierDataUpdateCoordinator(DataUpdateCoordinator[list[dict[str, Any]]]):
 
         if is_unauthorized_write:
             if should_escalate:
+                if self.config_entry is not None:
+                    self.config_entry.async_start_reauth(self.hass)
                 raise HomeAssistantError(
                     "Carrier repeatedly rejected requests. "
                     "Check credentials or Carrier service health."
@@ -331,7 +319,7 @@ class CarrierDataUpdateCoordinator(DataUpdateCoordinator[list[dict[str, Any]]]):
         ) from error
 
     async def _async_reconcile_failed_write(
-        self, operation_name: str, error: Exception | None = None
+        self, operation_name: str, error: BaseException | None = None
     ) -> None:
         """Refresh coordinator state after a write may have partially applied.
 
@@ -339,7 +327,7 @@ class CarrierDataUpdateCoordinator(DataUpdateCoordinator[list[dict[str, Any]]]):
             operation_name: Friendly name for the write operation that failed.
             error: Exception raised by the failed write, if available.
         """
-        if isinstance(error, TransportServerError) and self._is_unauthorized_error(error):
+        if error is not None and is_unauthorized_error(error):
             self.data_flush = True
 
         self._suppress_unauthorized_recording = True
@@ -347,13 +335,7 @@ class CarrierDataUpdateCoordinator(DataUpdateCoordinator[list[dict[str, Any]]]):
             # A write may have partially applied server-side before the transport
             # failed, so force a refresh before reporting or re-raising upstream.
             await self.async_refresh()
-        except (
-            CarrierUnauthorizedError,
-            HomeAssistantError,
-            TimeoutError,
-            TransportServerError,
-            UpdateFailed,
-        ) as refresh_error:  # pragma: no cover - defensive logging only
+        except RECONCILE_FAILED_WRITE_EXCEPTIONS as refresh_error:  # pragma: no cover
             _LOGGER.debug(
                 "refresh after failed %s write failed: %s",
                 operation_name,
@@ -386,8 +368,8 @@ class CarrierDataUpdateCoordinator(DataUpdateCoordinator[list[dict[str, Any]]]):
         for attempt in range(MAX_WRITE_ATTEMPTS):
             try:
                 result = await request()
-            except (TransportServerError, TimeoutError) as error:
-                if not self._is_retryable_write_error(error):
+            except RECOVERABLE_REFRESH_EXCEPTIONS as error:
+                if not is_retryable_write_error(error):
                     await self._async_reconcile_failed_write(operation_name, error)
                     raise HomeAssistantError(
                         "Failed to communicate with Carrier service — "
@@ -451,12 +433,16 @@ class CarrierDataUpdateCoordinator(DataUpdateCoordinator[list[dict[str, Any]]]):
         Returns:
             None: Listener state is refreshed in-place.
         """
-        self.timestamp_websocket = datetime.now(UTC)
-        _LOGGER.debug("websocket updated system")
-        if _LOGGER.isEnabledFor(logging.DEBUG):
-            for system in self.systems:
-                _LOGGER.debug(
-                    "%s",
-                    async_redact_data(self.mapped_system_data(system), TO_REDACT_MAPPED),
-                )
-        self.async_update_listeners()
+        try:
+            self.timestamp_websocket = datetime.now(UTC)
+            _LOGGER.debug("websocket updated system")
+            if _LOGGER.isEnabledFor(logging.DEBUG):
+                for system in self.systems:
+                    _LOGGER.debug(
+                        "%s",
+                        async_redact_data(self.mapped_system_data(system), TO_REDACT_MAPPED),
+                    )
+            self.async_update_listeners()
+        except WEBSOCKET_RECOVERABLE_EXCEPTIONS:
+            _LOGGER.debug("recoverable websocket update callback failure", exc_info=True)
+            _LOGGER.exception("websocket update callback failed")

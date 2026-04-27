@@ -3,29 +3,103 @@
 import asyncio
 import logging
 
-from aiohttp import ClientError
 from carrier_api import ApiConnectionGraphql
-from gql.transport.exceptions import TransportError, TransportServerError
+from gql.transport.exceptions import TransportServerError
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers import config_validation as cv
 
-from .carrier_data_update_coordinator import CarrierDataUpdateCoordinator, CarrierUnauthorizedError
+from .carrier_data_update_coordinator import CarrierDataUpdateCoordinator
 from .const import (
     DOMAIN,
     PLATFORMS,
     TO_REDACT,
+    UNAUTHORIZED_RETRY_THRESHOLD,
     WEBSOCKET_RETRY_INITIAL_DELAY_SECONDS,
     WEBSOCKET_RETRY_MAX_DELAY_SECONDS,
 )
-from .util import async_redact_data
+from .util import WEBSOCKET_RECOVERABLE_EXCEPTIONS, async_redact_data, is_unauthorized_error
 
 type ConfigEntryCarrier = ConfigEntry[CarrierDataUpdateCoordinator]
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
+SETUP_UNAUTHORIZED_COUNTS = "setup_unauthorized_counts"
+
+
+def _setup_unauthorized_key(config_entry: ConfigEntryCarrier) -> str:
+    """Return the stable key used for setup unauthorized retry tracking.
+
+    Args:
+        config_entry: Config entry currently being set up.
+
+    Returns:
+        str: Entry id when available, otherwise the configured username.
+    """
+    return config_entry.entry_id or str(config_entry.data[CONF_USERNAME])
+
+
+def _reset_setup_unauthorized_count(
+    hass: HomeAssistant,
+    config_entry: ConfigEntryCarrier,
+) -> None:
+    """Clear setup unauthorized retry tracking for a config entry.
+
+    Args:
+        hass: Home Assistant instance holding integration runtime data.
+        config_entry: Config entry whose setup tracking should be cleared.
+    """
+    domain_data = hass.data.get(DOMAIN)
+    if not isinstance(domain_data, dict):
+        return
+    setup_counts = domain_data.get(SETUP_UNAUTHORIZED_COUNTS)
+    if not isinstance(setup_counts, dict):
+        return
+    setup_counts.pop(_setup_unauthorized_key(config_entry), None)
+
+
+def _handle_setup_unauthorized(
+    hass: HomeAssistant,
+    config_entry: ConfigEntryCarrier,
+    error: BaseException,
+) -> None:
+    """Record setup unauthorized failures and raise the HA-facing exception.
+
+    Args:
+        hass: Home Assistant instance holding integration runtime data.
+        config_entry: Config entry currently being set up.
+        error: Unauthorized failure raised during setup or first refresh.
+
+    Raises:
+        ConfigEntryNotReady: Raised while unauthorized failures are still below
+            the retry threshold and may represent a transient Carrier outage.
+        ConfigEntryAuthFailed: Raised once repeated unauthorized failures should
+            start Home Assistant reauthentication.
+    """
+    domain_data = hass.data.setdefault(DOMAIN, {})
+    setup_counts = domain_data.setdefault(SETUP_UNAUTHORIZED_COUNTS, {})
+    setup_key = _setup_unauthorized_key(config_entry)
+    setup_count = int(setup_counts.get(setup_key, 0)) + 1
+
+    if setup_count < UNAUTHORIZED_RETRY_THRESHOLD:
+        setup_counts[setup_key] = setup_count
+        _LOGGER.info(
+            "Carrier API returned unauthorized during setup attempt %s; retrying setup.",
+            setup_count,
+        )
+        raise ConfigEntryNotReady(
+            "Carrier API temporarily rejected setup; retrying soon."
+        ) from error
+
+    setup_counts.pop(setup_key, None)
+    _LOGGER.error(
+        "Carrier API returned unauthorized during setup %s consecutive times; "
+        "starting reauthentication.",
+        setup_count,
+    )
+    raise ConfigEntryAuthFailed("Carrier API repeatedly rejected setup credentials.") from error
 
 
 async def _async_await_websocket_task(websocket_task: asyncio.Task[None]) -> None:
@@ -41,13 +115,7 @@ async def _async_await_websocket_task(websocket_task: asyncio.Task[None]) -> Non
         await websocket_task
     except asyncio.CancelledError:
         pass
-    except (
-        CarrierUnauthorizedError,
-        ClientError,
-        TimeoutError,
-        OSError,
-        TransportError,
-    ):
+    except WEBSOCKET_RECOVERABLE_EXCEPTIONS:
         _LOGGER.exception("websocket task raised during cancellation")
 
 
@@ -68,8 +136,8 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntryCarrie
     Raises:
         ConfigEntryNotReady: Raised when authentication or initial data loading
             fails and Home Assistant should retry setup later.
-        CarrierUnauthorizedError: Raised when repeated unauthorized responses
-            indicate invalid credentials rather than a transient outage.
+        ConfigEntryAuthFailed: Raised when repeated unauthorized responses
+            indicate invalid credentials and Home Assistant should reauth.
     """
     _LOGGER.debug(
         "async setup entry: %s",
@@ -83,6 +151,7 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntryCarrie
         coordinator = CarrierDataUpdateCoordinator(
             hass=hass,
             api_connection=api_connection,
+            config_entry=config_entry,
         )
         await coordinator.async_config_entry_first_refresh()
         config_entry.runtime_data = coordinator
@@ -111,13 +180,7 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntryCarrie
                 except asyncio.CancelledError:
                     _LOGGER.debug("websocket task cancelled")
                     raise
-                except (
-                    CarrierUnauthorizedError,
-                    ClientError,
-                    TimeoutError,
-                    OSError,
-                    TransportError,
-                ):
+                except WEBSOCKET_RECOVERABLE_EXCEPTIONS:
                     _LOGGER.exception(
                         "websocket task exception; retrying in %s seconds", retry_delay_seconds
                     )
@@ -146,21 +209,31 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntryCarrie
 
         config_entry.async_on_unload(cancel_websocket_task)
     except TransportServerError as error:
+        if is_unauthorized_error(error):
+            _handle_setup_unauthorized(hass, config_entry, error)
         _LOGGER.exception("Carrier transport error during setup")
         raise ConfigEntryNotReady(error) from error
-    except CarrierUnauthorizedError:
+    except ConfigEntryAuthFailed as error:
+        if is_unauthorized_error(error):
+            _handle_setup_unauthorized(hass, config_entry, error)
         _LOGGER.exception("Carrier unauthorized during setup")
         raise
     except ConfigEntryNotReady as error:
+        if is_unauthorized_error(error):
+            _LOGGER.exception("Carrier unauthorized during setup")
+            _handle_setup_unauthorized(hass, config_entry, error)
         if isinstance(error.__cause__, TransportServerError):
             transport_error = error.__cause__
             _LOGGER.exception("Carrier transport error during setup")
             raise ConfigEntryNotReady(transport_error) from transport_error
-        if isinstance(error.__cause__, CarrierUnauthorizedError):
-            unauthorized_error = error.__cause__
-            _LOGGER.exception("Carrier unauthorized during setup")
-            raise unauthorized_error from error
         raise
+    except WEBSOCKET_RECOVERABLE_EXCEPTIONS as error:
+        if is_unauthorized_error(error):
+            _handle_setup_unauthorized(hass, config_entry, error)
+        _LOGGER.exception("Carrier recoverable error during setup")
+        raise ConfigEntryNotReady(error) from error
+
+    _reset_setup_unauthorized_count(hass, config_entry)
 
     await hass.config_entries.async_forward_entry_setups(config_entry, PLATFORMS)
 

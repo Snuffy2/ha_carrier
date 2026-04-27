@@ -8,10 +8,23 @@
           "username": "Username",
           "password": "Password"
         }
+      },
+      "reauth_confirm": {
+        "title": "[%key:common::config_flow::step::reauth_confirm::title%]",
+        "description": "Carrier needs your credentials refreshed. Enter your Carrier account username and password to continue.",
+        "data": {
+          "username": "Username",
+          "password": "Password"
+        }
       }
     },
     "error": {
-      "auth": "Login failed. Please use official app to logout and log back in and try again."
+      "cannot_connect": "Unable to connect to Carrier. Check your network connection and try again.",
+      "auth": "Authentication failed. Check your Carrier username and password, then try again.",
+      "unknown": "Carrier returned an unexpected response. Check the logs and try again."
+    },
+    "abort": {
+      "reauth_successful": "[%key:common::config_flow::abort::reauth_successful%]"
     }
   },
   "options": {
