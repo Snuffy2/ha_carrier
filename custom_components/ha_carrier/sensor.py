@@ -26,16 +26,6 @@ from .util import ENERGY_METRIC_MAP, TIMESTAMP_TYPES
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
-ENERGY_METRIC_MAP: dict[str, str] = {
-    "cooling": "coolingKwh",
-    "hp_heat": "hPHeatKwh",
-    "fan": "fanKwh",
-    "electric_heat": "eHeatKwh",
-    "reheat": "reheatKwh",
-    "fan_gas": "fanGasKwh",
-    "loop_pump": "loopPumpKwh",
-}
-
 
 async def async_setup_entry(
     hass: HomeAssistant,
