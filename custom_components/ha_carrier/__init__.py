@@ -39,18 +39,20 @@ ENERGY_METRICS: tuple[str, ...] = (
     "fan_gas",
     "loop_pump",
 )
-SYSTEM_ENTITY_SUFFIXES: tuple[str, ...] = (
+ALWAYS_CREATED_SYSTEM_ENTITY_SUFFIXES: tuple[str, ...] = (
     "Online",
-    "Humidifier Running",
-    "Heat Source",
     "Outdoor Temperature",
     "Filter Remaining",
-    "Humidifier Remaining",
-    "UV Lamp Remaining",
     "Airflow",
     "Static Pressure",
     "ODU Status",
     "IDU Status",
+)
+CONDITIONALLY_CREATED_SYSTEM_ENTITY_SUFFIXES: tuple[str, ...] = (
+    "Humidifier Running",
+    "Heat Source",
+    "Humidifier Remaining",
+    "UV Lamp Remaining",
     "ODU Var",
 )
 
