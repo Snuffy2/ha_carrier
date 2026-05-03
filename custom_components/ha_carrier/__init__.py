@@ -45,33 +45,6 @@ type ConfigEntryCarrier = ConfigEntry[CarrierDataUpdateCoordinator]
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
-# For migrations from version 1 to 2
-ENERGY_METRICS: tuple[str, ...] = (
-    "cooling",
-    "hp_heat",
-    "fan",
-    "electric_heat",
-    "reheat",
-    "fan_gas",
-    "loop_pump",
-)
-ALWAYS_CREATED_SYSTEM_ENTITY_SUFFIXES: tuple[str, ...] = (
-    "Online",
-    "Outdoor Temperature",
-    "Filter Remaining",
-    "Airflow",
-    "Static Pressure",
-    "ODU Status",
-    "IDU Status",
-)
-CONDITIONALLY_CREATED_SYSTEM_ENTITY_SUFFIXES: tuple[str, ...] = (
-    "Humidifier Running",
-    "Heat Source",
-    "Humidifier Remaining",
-    "UV Lamp Remaining",
-    "ODU Var",
-)
-
 
 async def _async_await_websocket_task(websocket_task: asyncio.Task[None]) -> None:
     """Await websocket task shutdown after cancellation.
