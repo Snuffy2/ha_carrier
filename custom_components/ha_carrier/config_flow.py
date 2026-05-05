@@ -65,8 +65,14 @@ async def _async_validate_credentials(
                 _LOGGER.exception(
                     "Failed to clean up Carrier API connection after credential validation"
                 )
-
-    identity_id = user_info.get("identityId")
+    if not isinstance(user_info, dict) or not user_info:
+        _LOGGER.error("Carrier API did not return user info for validated credentials")
+        return {"base": ERROR_UNKNOWN}, None
+    user_details = user_info.get("user")
+    if not isinstance(user_details, dict) or not user_details:
+        _LOGGER.warning("Carrier API did not return a user section for validated credentials")
+        return {"base": ERROR_UNKNOWN}, None
+    identity_id = user_details.get("identityId")
     if not isinstance(identity_id, str) or not identity_id:
         _LOGGER.error("Carrier API did not return an identity ID for validated credentials")
         return {"base": ERROR_UNKNOWN}, None
@@ -250,6 +256,7 @@ class CarrierConfigFlow(ConfigFlow, domain=DOMAIN):
                         errors=errors,
                     )
                 existing_entry = await self.async_set_unique_id(identity_id)
+                self._abort_if_unique_id_mismatch()
                 if existing_entry is not None and existing_entry.entry_id != reauth_entry.entry_id:
                     self._abort_if_unique_id_configured()
                 return self.async_update_reload_and_abort(
