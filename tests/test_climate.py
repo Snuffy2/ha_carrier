@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any
+from typing import Any, cast
 
-from carrier_api import FanModes
+from carrier_api import ActivityTypes, ConfigZoneActivity, FanModes
 from homeassistant.components.climate import (
     ATTR_HVAC_MODE,
     ATTR_PRESET_MODE,
@@ -48,6 +48,43 @@ async def test_climate_platform_registers_zone_thermostat(
     assert state.state == HVACMode.HEAT_COOL
     assert state.attributes["current_temperature"] == 21.1
     assert FAN_AUTO in state.attributes["fan_modes"]
+
+
+@pytest.mark.asyncio
+async def test_climate_preset_uses_current_activity_when_setpoints_match_multiple_profiles(
+    hass: HomeAssistant,
+    carrier_api: FakeCarrierApiConnection,
+    setup_integration: Callable[..., Any],
+) -> None:
+    """Prefer the API current activity when multiple profiles share setpoints."""
+    carrier_api.systems = [build_carrier_system()]
+    system = carrier_api.systems[0]
+    zone = system.config.zones[0]
+    status_zone = system.status.zones[0]
+    manual_activity = zone.find_activity(ActivityTypes.MANUAL)
+    assert manual_activity is not None
+    cast("Any", zone).hold_activity = None
+    wake_activity = ConfigZoneActivity(
+        {
+            "type": "wake",
+            "id": "wake",
+            "fan": "med",
+            "htsp": manual_activity.heat_set_point,
+            "clsp": manual_activity.cool_set_point,
+        }
+    )
+    zone.activities.append(wake_activity)
+    status_zone.current_activity = ActivityTypes.WAKE
+    status_zone.heat_set_point = manual_activity.heat_set_point
+    status_zone.cool_set_point = manual_activity.cool_set_point
+
+    await setup_integration()
+
+    entity_id = entity_id_for_unique_id(hass, CLIMATE_DOMAIN, "abc123_zone_1_thermostat")
+    state = hass.states.get(entity_id)
+
+    assert state is not None
+    assert state.attributes[ATTR_PRESET_MODE] == ActivityTypes.WAKE.value
 
 
 @pytest.mark.asyncio
