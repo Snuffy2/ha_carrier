@@ -2,7 +2,7 @@ name: prek Autoupdate
 
 on:
   schedule:
-    - cron: '17 5 * * 1'
+    - cron: '17 5 * * *'
   workflow_dispatch:
 
 jobs:
@@ -12,3 +12,9 @@ jobs:
       contents: write
       pull-requests: write
       actions: write
+    with:
+      update-day: "1"
+      dispatch-workflows: |
+        lint.yml
+        pytest_coverage.yml
+        validate.yml
