@@ -72,7 +72,7 @@ The integration adds a Home Assistant device per Carrier system, with entities f
 ### Other
 
 - Configuration entirely through the Home Assistant UI — no YAML required
-- Near real-time updates via Carrier's websocket push channel, with periodic polling as a fallback
+- Near real-time updates via Carrier's websocket push channel, with an authoritative status refresh every five minutes to correct silently stale push data
 - Automatic re-authentication prompt if your Carrier password changes
 - Supports multiple Carrier systems on the same account
 
@@ -139,7 +139,7 @@ If something isn't working as expected:
 
 - **"Invalid authentication"** — double-check your username and password in the Carrier mobile app. If the mobile app works but Home Assistant doesn't, open an issue with diagnostics.
 - **Entities show as unavailable** — check the **Online** binary sensor for the system. If it reports offline, the thermostat has lost its connection to Carrier's cloud (often a router or internet issue at the thermostat's location).
-- **Slow updates** — most state changes arrive within a few seconds via websocket; energy data is refreshed at most every 30 minutes.
+- **Slow updates** — most state changes arrive within a few seconds via websocket. Authoritative status is refreshed every five minutes to recover missed push updates, while energy data is refreshed at most every 30 minutes.
 
 ## Support
 

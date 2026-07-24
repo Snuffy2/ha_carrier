@@ -76,6 +76,9 @@ class FakeCarrierApiConnection:
         self.password = password
         self.identity_id = identity_id
         self.systems = systems or [build_carrier_system()]
+        self.statuses: dict[str, Status] = {
+            system.profile.serial: deepcopy(system.status) for system in self.systems
+        }
         self.entry_level_systems: list[EntryLevelSystem] = entry_level_systems or []
         self.api_websocket = FakeCarrierWebsocket()
         self.calls: list[tuple[str, dict[str, Any]]] = []
@@ -88,6 +91,30 @@ class FakeCarrierApiConnection:
         if self.load_data_error is not None:
             raise self.load_data_error
         return self.systems
+
+    async def refresh_system_statuses(self, systems: list[System]) -> set[str]:
+        """Replace matching system statuses from the prepared snapshots.
+
+        Args:
+            systems: Existing system aggregates to refresh in place.
+
+        Returns:
+            Serials whose statuses were refreshed.
+        """
+        self.calls.append(
+            (
+                "refresh_system_statuses",
+                {"system_serials": [system.profile.serial for system in systems]},
+            )
+        )
+        refreshed: set[str] = set()
+        for system in systems:
+            status = self.statuses.get(system.profile.serial)
+            if status is None:
+                continue
+            system.status = deepcopy(status)
+            refreshed.add(system.profile.serial)
+        return refreshed
 
     async def load_entry_level_data(self) -> list[EntryLevelSystem]:
         """Return configured entry-level systems."""

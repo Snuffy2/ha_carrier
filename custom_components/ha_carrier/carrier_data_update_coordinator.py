@@ -19,8 +19,8 @@ from homeassistant.helpers.update_coordinator import (
 )
 
 from .const import (
-    DEFAULT_UPDATE_INTERVAL_MINUTES,
     DOMAIN,
+    ENERGY_REFRESH_INTERVAL_MINUTES,
     FULL_RECONCILE_INTERVAL_MINUTES,
     MAX_REFRESH_ATTEMPTS,
     MAX_WRITE_ATTEMPTS,
@@ -28,6 +28,7 @@ from .const import (
     REFRESH_RETRY_BASE_DELAY_SECONDS,
     REFRESH_RETRY_MAX_DELAY_SECONDS,
     RETRY_JITTER_FRACTION,
+    STATUS_REFRESH_INTERVAL_MINUTES,
     TO_REDACT_MAPPED,
     TRANSIENT_FAILURE_THRESHOLD,
     UNAUTHORIZED_RETRY_THRESHOLD,
@@ -46,6 +47,7 @@ from .util import (
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
 FULL_RECONCILE_INTERVAL = timedelta(minutes=FULL_RECONCILE_INTERVAL_MINUTES)
+ENERGY_REFRESH_INTERVAL = timedelta(minutes=ENERGY_REFRESH_INTERVAL_MINUTES)
 POST_WRITE_INTERCEPT_WINDOW = timedelta(minutes=POST_WRITE_INTERCEPT_WINDOW_MINUTES)
 
 REFRESH_RETRY_POLICY = RetryPolicy(
@@ -99,6 +101,7 @@ class CarrierDataUpdateCoordinator(DataUpdateCoordinator[list[dict[str, Any]]]):
         self._websocket_initialized = False
         self.data_flush = True
         self.timestamp_all_data: datetime | None = None
+        self.timestamp_status: datetime | None = None
         self.timestamp_websocket: datetime | None = None
         self.timestamp_energy: datetime | None = None
         self._intercept_guards: dict[tuple[str, str | None], dict[str, Any]] = {}
@@ -107,7 +110,7 @@ class CarrierDataUpdateCoordinator(DataUpdateCoordinator[list[dict[str, Any]]]):
             hass,
             _LOGGER,
             name=f"{DOMAIN}-{self.api_connection.username}",
-            update_interval=timedelta(minutes=DEFAULT_UPDATE_INTERVAL_MINUTES),
+            update_interval=timedelta(minutes=STATUS_REFRESH_INTERVAL_MINUTES),
             always_update=False,
             request_refresh_debouncer=Debouncer(
                 hass,
@@ -119,13 +122,11 @@ class CarrierDataUpdateCoordinator(DataUpdateCoordinator[list[dict[str, Any]]]):
         )
 
     def _full_reconcile_due(self) -> bool:
-        """Return True when websocket-maintained data is overdue for a full fetch.
+        """Return True when account data is overdue for a complete fetch.
 
-        In steady state the poll cycle only refreshes energy and relies on
-        websocket deltas for status. A delta that is dropped or rebroadcast stale
-        leaves a status field frozen with no self-correction while the socket
-        stays connected. A periodic full refresh reconciles that state against an
-        authoritative pull.
+        Lightweight polling keeps runtime status and energy current. A periodic
+        full refresh remains responsible for account topology, profile, and
+        configuration changes while the websocket stays connected.
 
         Returns:
             bool: True when the last full refresh is older than
@@ -134,6 +135,17 @@ class CarrierDataUpdateCoordinator(DataUpdateCoordinator[list[dict[str, Any]]]):
         if self.timestamp_all_data is None:
             return True
         return datetime.now(UTC) - self.timestamp_all_data >= FULL_RECONCILE_INTERVAL
+
+    def _energy_refresh_due(self) -> bool:
+        """Return True when energy data is due for its independent refresh.
+
+        Returns:
+            bool: True when energy has never refreshed or its refresh interval
+                has elapsed.
+        """
+        if self.timestamp_energy is None:
+            return True
+        return datetime.now(UTC) - self.timestamp_energy >= ENERGY_REFRESH_INTERVAL
 
     def begin_post_write_intercept(
         self, system_serial: str, zone_api_id: str | None = None
@@ -231,13 +243,13 @@ class CarrierDataUpdateCoordinator(DataUpdateCoordinator[list[dict[str, Any]]]):
     def _reassert_control(self) -> None:
         """Restore reverted control fields on every written target with a live guard.
 
-        Runs after ``message_handler`` has applied a websocket message. Only each
-        guarded target — a written system's mode, or a written zone's set point — is
-        considered; every other system, zone, and non-control field is left exactly
-        as delivered, so a revert on a guarded target never drops — or reverts —
-        another target's update. Does not read the API. When Carrier finally accepts
-        a write its value matches the snapshot and nothing is rewritten; when a
-        guard expires that target is trusted again.
+        Runs after a websocket update or status-only refresh has been applied.
+        Only each guarded target — a written system's mode, or a written zone's
+        set point — is considered; every other system, zone, and non-control
+        field is left exactly as delivered, so a revert on a guarded target never
+        drops — or reverts — another target's update. Does not read the API. When
+        Carrier finally accepts a write its value matches the snapshot and
+        nothing is rewritten; when a guard expires that target is trusted again.
         """
         self._prune_intercept_guards()
         for (system_serial, zone_api_id), guard in self._intercept_guards.items():
@@ -273,9 +285,10 @@ class CarrierDataUpdateCoordinator(DataUpdateCoordinator[list[dict[str, Any]]]):
     async def _async_update_data(self) -> list[dict[str, Any]]:
         """Fetch Carrier data and translate escalated failures for Home Assistant.
 
-        Performs either a full system refresh or a lighter energy-only refresh,
-        depending on whether the coordinator has been marked dirty. The shared
-        `ResiliencyState` tracks 401 and transient failures across API calls.
+        Performs a full system refresh when marked dirty or overdue. Otherwise,
+        it refreshes authoritative runtime status and refreshes energy only when
+        its independent interval is due. The shared `ResiliencyState` tracks 401
+        and transient failures across API calls.
         Unauthorized failures only become `ConfigEntryAuthFailed` after a fresh
         refresh attempt fails and crosses the shared threshold, so a later
         successful refresh can still clear an old outage window. Non-escalated
@@ -298,15 +311,16 @@ class CarrierDataUpdateCoordinator(DataUpdateCoordinator[list[dict[str, Any]]]):
             )
             self.data_flush = True
 
-        if self.data_flush:
-            refresh_context = "full data refresh"
-            refresh_operation = self._async_full_refresh
-        else:
-            refresh_context = "energy refresh"
-            refresh_operation = self._async_energy_refresh
-
         try:
-            await refresh_operation()
+            if self.data_flush:
+                refresh_context = "full data refresh"
+                await self._async_full_refresh()
+            else:
+                refresh_context = "status refresh"
+                await self._async_status_refresh()
+                if self._energy_refresh_due():
+                    refresh_context = "energy refresh"
+                    await self._async_energy_refresh()
             return [self.mapped_system_data(system) for system in self.systems]
         except CarrierUnauthorizedError as error:
             self.data_flush = True
@@ -400,12 +414,32 @@ class CarrierDataUpdateCoordinator(DataUpdateCoordinator[list[dict[str, Any]]]):
                     async_redact_data(self.mapped_system_data(system), TO_REDACT_MAPPED),
                 )
         self.timestamp_all_data = datetime.now(UTC)
+        self.timestamp_status = self.timestamp_all_data
         self.timestamp_energy = self.timestamp_all_data
         self.data_flush = False
-        self.update_interval = timedelta(minutes=DEFAULT_UPDATE_INTERVAL_MINUTES)
+        self.update_interval = timedelta(minutes=STATUS_REFRESH_INTERVAL_MINUTES)
         # A full read is authoritative; end every post-write guard so re-assert
         # cannot fight freshly-read truth.
         self._intercept_guards = {}
+
+    async def _async_status_refresh(self) -> None:
+        """Refresh authoritative status without loading config or energy data."""
+        _LOGGER.debug("fetching fresh system status")
+        refreshed_serials: set[str] = await async_call_with_retry(
+            functools.partial(self.api_connection.refresh_system_statuses, self.systems),
+            policy=REFRESH_RETRY_POLICY,
+            state=self.resiliency,
+            operation_name="status refresh",
+            logger=_LOGGER,
+        )
+        if self._in_post_write_intercept():
+            # A status-only read does not refresh config, so retain active write
+            # guards and re-assert their protected control fields. Volatile
+            # status such as zone conditioning remains exactly as fetched.
+            self._reassert_control()
+        self.timestamp_status = datetime.now(UTC)
+        self.update_interval = timedelta(minutes=STATUS_REFRESH_INTERVAL_MINUTES)
+        _LOGGER.debug("refreshed status for %d Carrier systems", len(refreshed_serials))
 
     async def _async_energy_refresh(self) -> None:
         """Refresh energy data while accounting for failures once per cycle.
@@ -454,7 +488,7 @@ class CarrierDataUpdateCoordinator(DataUpdateCoordinator[list[dict[str, Any]]]):
             self.resiliency.reset_unauthorized()
             self.resiliency.reset_transient()
             self.timestamp_energy = datetime.now(UTC)
-            self.update_interval = timedelta(minutes=DEFAULT_UPDATE_INTERVAL_MINUTES)
+            self.update_interval = timedelta(minutes=STATUS_REFRESH_INTERVAL_MINUTES)
 
     async def _async_handle_failed_write(
         self,

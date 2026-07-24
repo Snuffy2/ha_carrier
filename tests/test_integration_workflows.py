@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from copy import deepcopy
 from datetime import timedelta
 from inspect import isawaitable
 
 from carrier_api import CarrierApiConnectionError
 from homeassistant import config_entries
 from homeassistant.components.climate import (
+    ATTR_HVAC_ACTION,
     ATTR_HVAC_MODE,
     DOMAIN as CLIMATE_DOMAIN,
     SERVICE_SET_HVAC_MODE,
+    HVACAction,
     HVACMode,
 )
 from homeassistant.components.select import (
@@ -32,9 +35,9 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry, async_
 from custom_components.ha_carrier import async_migrate_entry
 from custom_components.ha_carrier.const import (
     CONF_INFINITE_HOLDS,
-    DEFAULT_UPDATE_INTERVAL_MINUTES,
     DOMAIN,
     HEAT_SOURCE_ODU_ONLY_LABEL,
+    STATUS_REFRESH_INTERVAL_MINUTES,
 )
 
 from .conftest import (
@@ -111,29 +114,45 @@ async def test_options_workflow_reloads_and_unloads_without_lingering_coordinato
 
 
 @pytest.mark.asyncio
-async def test_scheduled_refresh_uses_energy_path_and_unload_cancels_future_refresh(
+async def test_scheduled_status_refresh_corrects_state_and_unload_cancels_future_refresh(
     hass: HomeAssistant,
     carrier_api: FakeCarrierApiConnection,
     setup_integration: Callable[..., Awaitable[ConfigEntry]],
 ) -> None:
-    """Advance HA time through a scheduled refresh and then unload cleanly."""
+    """Correct stale zone state on schedule and then unload cleanly."""
     config_entry = await setup_integration()
+    system = carrier_api.systems[0]
+    climate_entity_id = entity_id_for_unique_id(
+        hass,
+        CLIMATE_DOMAIN,
+        f"{system.profile.serial.lower()}_zone_1_thermostat",
+    )
+    state = hass.states.get(climate_entity_id)
+    assert state is not None
+    assert state.attributes[ATTR_HVAC_ACTION] is HVACAction.IDLE
+
+    fresh_status = deepcopy(system.status)
+    fresh_status.zones[0].conditioning = "active_cool"
+    carrier_api.statuses[system.profile.serial] = fresh_status
     carrier_api.calls.clear()
 
     async_fire_time_changed(
         hass,
-        dt_util.utcnow() + timedelta(minutes=DEFAULT_UPDATE_INTERVAL_MINUTES),
+        dt_util.utcnow() + timedelta(minutes=STATUS_REFRESH_INTERVAL_MINUTES),
     )
     await hass.async_block_till_done()
 
-    assert [call[0] for call in carrier_api.calls] == ["get_energy"]
+    assert [call[0] for call in carrier_api.calls] == ["refresh_system_statuses"]
+    state = hass.states.get(climate_entity_id)
+    assert state is not None
+    assert state.attributes[ATTR_HVAC_ACTION] is HVACAction.COOLING
     coordinator = config_entry.runtime_data
     await _async_unload_loaded_entry(hass, config_entry)
 
     carrier_api.calls.clear()
     async_fire_time_changed(
         hass,
-        dt_util.utcnow() + timedelta(minutes=DEFAULT_UPDATE_INTERVAL_MINUTES),
+        dt_util.utcnow() + timedelta(minutes=STATUS_REFRESH_INTERVAL_MINUTES),
     )
     await hass.async_block_till_done()
 
@@ -163,7 +182,7 @@ async def test_refresh_failure_and_recovery_update_poll_interval_in_ha_workflow(
     await coordinator.async_refresh()
 
     assert coordinator.last_update_success is True
-    assert coordinator.update_interval == timedelta(minutes=DEFAULT_UPDATE_INTERVAL_MINUTES)
+    assert coordinator.update_interval == timedelta(minutes=STATUS_REFRESH_INTERVAL_MINUTES)
 
 
 @pytest.mark.asyncio

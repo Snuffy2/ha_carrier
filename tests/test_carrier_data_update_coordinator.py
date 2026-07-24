@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
-from carrier_api import CarrierApiAuthError, CarrierApiConnectionError, CarrierApiGraphqlError
+from carrier_api import (
+    ActivityTypes,
+    CarrierApiAuthError,
+    CarrierApiConnectionError,
+    CarrierApiGraphqlError,
+)
 from homeassistant.exceptions import ConfigEntryAuthFailed, HomeAssistantError
 from homeassistant.helpers.update_coordinator import UpdateFailed
 import pytest
@@ -16,7 +22,9 @@ from custom_components.ha_carrier.carrier_data_update_coordinator import (
     CarrierDataUpdateCoordinator,
 )
 from custom_components.ha_carrier.const import (
+    ENERGY_REFRESH_INTERVAL_MINUTES,
     FULL_RECONCILE_INTERVAL_MINUTES,
+    STATUS_REFRESH_INTERVAL_MINUTES,
     TRANSIENT_FAILURE_THRESHOLD,
     UNAUTHORIZED_RETRY_THRESHOLD,
 )
@@ -87,6 +95,51 @@ async def test_energy_refresh_uses_cycle_scoped_success_reset(
         await coordinator._async_energy_refresh()
 
     assert calls[0]["reset_state_on_success"] is False
+
+
+@pytest.mark.asyncio
+async def test_status_refresh_corrects_state_and_preserves_active_write_guard(
+    carrier_api: FakeCarrierApiConnection,
+) -> None:
+    """Apply authoritative status while retaining guarded control values."""
+    coordinator = CarrierDataUpdateCoordinator.__new__(CarrierDataUpdateCoordinator)
+    system = build_carrier_system()
+    coordinator.systems = [system]
+    _set_coordinator_api_connection(coordinator, carrier_api)
+    coordinator.resiliency = ResiliencyState(
+        unauthorized_threshold=UNAUTHORIZED_RETRY_THRESHOLD,
+        transient_threshold=TRANSIENT_FAILURE_THRESHOLD,
+    )
+    coordinator._intercept_guards = {}
+    coordinator.update_interval = None
+
+    status_zone = system.status.zones[0]
+    original_activity = status_zone.current_status_activity_type
+    original_heat_set_point = status_zone.heat_set_point
+    original_cool_set_point = status_zone.cool_set_point
+    coordinator.begin_post_write_intercept(system.profile.serial, status_zone.api_id)
+
+    fresh_status = deepcopy(system.status)
+    fresh_zone = fresh_status.zones[0]
+    fresh_zone.conditioning = "active_cool"
+    fresh_zone.current_status_activity_type = ActivityTypes.AWAY
+    fresh_zone.heat_set_point = 60
+    fresh_zone.cool_set_point = 85
+    carrier_api.statuses[system.profile.serial] = fresh_status
+    original_system = system
+
+    await coordinator._async_status_refresh()
+
+    refreshed_zone = system.status.zones[0]
+    assert system is original_system
+    assert refreshed_zone.conditioning == "active_cool"
+    assert refreshed_zone.current_status_activity_type is original_activity
+    assert refreshed_zone.heat_set_point == original_heat_set_point
+    assert refreshed_zone.cool_set_point == original_cool_set_point
+    assert (system.profile.serial, status_zone.api_id) in coordinator._intercept_guards
+    assert coordinator.timestamp_status is not None
+    assert coordinator.update_interval == timedelta(minutes=STATUS_REFRESH_INTERVAL_MINUTES)
+    assert [call[0] for call in carrier_api.calls] == ["refresh_system_statuses"]
 
 
 @pytest.mark.asyncio
@@ -261,6 +314,30 @@ async def test_update_data_keeps_plain_unauthorized_server_error_retryable() -> 
 
 
 @pytest.mark.asyncio
+async def test_update_data_marks_status_refresh_failure_for_full_recovery() -> None:
+    """Fall back to a full refresh after a lightweight status request fails."""
+    coordinator = CarrierDataUpdateCoordinator.__new__(CarrierDataUpdateCoordinator)
+    coordinator.data_flush = False
+    coordinator.systems = [build_carrier_system()]
+    coordinator.timestamp_all_data = datetime.now(UTC)
+    coordinator.timestamp_energy = datetime.now(UTC)
+    coordinator.update_interval = None
+
+    async def fake_status_refresh() -> None:
+        """Raise a transient status refresh failure."""
+        raise CarrierApiConnectionError("status unavailable")
+
+    with (
+        patch.object(coordinator, "_async_status_refresh", fake_status_refresh),
+        pytest.raises(UpdateFailed, match="status refresh"),
+    ):
+        await coordinator._async_update_data()
+
+    assert coordinator.data_flush is True
+    assert coordinator.update_interval == timedelta(minutes=1)
+
+
+@pytest.mark.asyncio
 async def test_full_refresh_merges_new_changed_and_stale_systems(
     carrier_api: FakeCarrierApiConnection,
 ) -> None:
@@ -329,6 +406,7 @@ async def test_update_data_forces_full_refresh_when_reconcile_interval_elapsed()
         minutes=FULL_RECONCILE_INTERVAL_MINUTES + 1
     )
     full_refresh_called = False
+    status_refresh_called = False
     energy_refresh_called = False
 
     async def fake_full_refresh(self: CarrierDataUpdateCoordinator) -> None:
@@ -342,8 +420,14 @@ async def test_update_data_forces_full_refresh_when_reconcile_interval_elapsed()
         nonlocal energy_refresh_called
         energy_refresh_called = True
 
+    async def fake_status_refresh(self: CarrierDataUpdateCoordinator) -> None:
+        """Record an unexpected lightweight status refresh."""
+        nonlocal status_refresh_called
+        status_refresh_called = True
+
     with (
         patch.object(CarrierDataUpdateCoordinator, "_async_full_refresh", fake_full_refresh),
+        patch.object(CarrierDataUpdateCoordinator, "_async_status_refresh", fake_status_refresh),
         patch.object(CarrierDataUpdateCoordinator, "_async_energy_refresh", fake_energy_refresh),
         patch.object(
             CarrierDataUpdateCoordinator,
@@ -354,19 +438,24 @@ async def test_update_data_forces_full_refresh_when_reconcile_interval_elapsed()
         await coordinator._async_update_data()
 
     assert full_refresh_called is True
+    assert status_refresh_called is False
     assert energy_refresh_called is False
 
 
 @pytest.mark.asyncio
-async def test_update_data_stays_energy_only_before_reconcile_interval() -> None:
-    """Keep the periodic poll energy-only until the full-reconcile interval elapses."""
+async def test_update_data_refreshes_status_without_energy_before_energy_interval() -> None:
+    """Refresh status every tick while leaving fresh energy untouched."""
     coordinator = CarrierDataUpdateCoordinator.__new__(CarrierDataUpdateCoordinator)
     coordinator.data_flush = False
     coordinator.systems = [build_carrier_system()]
     coordinator.timestamp_all_data = datetime.now(UTC) - timedelta(
         minutes=FULL_RECONCILE_INTERVAL_MINUTES - 1
     )
+    coordinator.timestamp_energy = datetime.now(UTC) - timedelta(
+        minutes=ENERGY_REFRESH_INTERVAL_MINUTES - 1
+    )
     full_refresh_called = False
+    status_refresh_called = False
     energy_refresh_called = False
 
     async def fake_full_refresh(self: CarrierDataUpdateCoordinator) -> None:
@@ -375,12 +464,18 @@ async def test_update_data_stays_energy_only_before_reconcile_interval() -> None
         full_refresh_called = True
 
     async def fake_energy_refresh(self: CarrierDataUpdateCoordinator) -> None:
-        """Record the expected energy-only refresh."""
+        """Record an unexpected energy refresh."""
         nonlocal energy_refresh_called
         energy_refresh_called = True
 
+    async def fake_status_refresh(self: CarrierDataUpdateCoordinator) -> None:
+        """Record the expected lightweight status refresh."""
+        nonlocal status_refresh_called
+        status_refresh_called = True
+
     with (
         patch.object(CarrierDataUpdateCoordinator, "_async_full_refresh", fake_full_refresh),
+        patch.object(CarrierDataUpdateCoordinator, "_async_status_refresh", fake_status_refresh),
         patch.object(CarrierDataUpdateCoordinator, "_async_energy_refresh", fake_energy_refresh),
         patch.object(
             CarrierDataUpdateCoordinator,
@@ -390,8 +485,45 @@ async def test_update_data_stays_energy_only_before_reconcile_interval() -> None
     ):
         await coordinator._async_update_data()
 
-    assert energy_refresh_called is True
     assert full_refresh_called is False
+    assert status_refresh_called is True
+    assert energy_refresh_called is False
+
+
+@pytest.mark.asyncio
+async def test_update_data_refreshes_status_and_overdue_energy() -> None:
+    """Refresh status and energy together when the energy interval has elapsed."""
+    coordinator = CarrierDataUpdateCoordinator.__new__(CarrierDataUpdateCoordinator)
+    coordinator.data_flush = False
+    coordinator.systems = [build_carrier_system()]
+    coordinator.timestamp_all_data = datetime.now(UTC) - timedelta(
+        minutes=FULL_RECONCILE_INTERVAL_MINUTES - 1
+    )
+    coordinator.timestamp_energy = datetime.now(UTC) - timedelta(
+        minutes=ENERGY_REFRESH_INTERVAL_MINUTES + 1
+    )
+    calls: list[str] = []
+
+    async def fake_status_refresh(self: CarrierDataUpdateCoordinator) -> None:
+        """Record the status refresh."""
+        calls.append("status")
+
+    async def fake_energy_refresh(self: CarrierDataUpdateCoordinator) -> None:
+        """Record the energy refresh."""
+        calls.append("energy")
+
+    with (
+        patch.object(CarrierDataUpdateCoordinator, "_async_status_refresh", fake_status_refresh),
+        patch.object(CarrierDataUpdateCoordinator, "_async_energy_refresh", fake_energy_refresh),
+        patch.object(
+            CarrierDataUpdateCoordinator,
+            "mapped_system_data",
+            staticmethod(lambda _system: {"serial": "ABC123"}),
+        ),
+    ):
+        await coordinator._async_update_data()
+
+    assert calls == ["status", "energy"]
 
 
 def test_full_reconcile_due_covers_timestamp_states() -> None:
@@ -410,6 +542,24 @@ def test_full_reconcile_due_covers_timestamp_states() -> None:
         minutes=FULL_RECONCILE_INTERVAL_MINUTES - 1
     )
     assert coordinator._full_reconcile_due() is False
+
+
+def test_energy_refresh_due_covers_timestamp_states() -> None:
+    """Report energy due when never refreshed or overdue, and not when fresh."""
+    coordinator = CarrierDataUpdateCoordinator.__new__(CarrierDataUpdateCoordinator)
+
+    coordinator.timestamp_energy = None
+    assert coordinator._energy_refresh_due() is True
+
+    coordinator.timestamp_energy = datetime.now(UTC) - timedelta(
+        minutes=ENERGY_REFRESH_INTERVAL_MINUTES + 1
+    )
+    assert coordinator._energy_refresh_due() is True
+
+    coordinator.timestamp_energy = datetime.now(UTC) - timedelta(
+        minutes=ENERGY_REFRESH_INTERVAL_MINUTES - 1
+    )
+    assert coordinator._energy_refresh_due() is False
 
 
 @pytest.mark.asyncio
